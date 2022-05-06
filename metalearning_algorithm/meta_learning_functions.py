@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import scipy
 import random
 import tqdm
@@ -13,13 +14,19 @@ from jax import jit
 from jax.example_libraries import optimizers
 from jax.tree_util import tree_multimap
 
+#hyperparameters
+epochs=2000
+batch_size=30 #inner batch size for inner loop#K=20 #K-shot learning
+num_task_sample= 4 #number of tasks to sample to meta train
+times=10
+test_task_num=5
+lr=0.00001
 rng=jax.random.PRNGKey(1)
 num_task_sample=5
 ethnic_grp_min_pop=60 #min population among all subpopulatiosn
 reg_weight=0.1
 reg_weight_lin=0.01
 reg_weight_maml=0.01
-lr=0.001
 
 
 def linear_model(eth, x, hsq=0.1,num_causal_snps=10,verbose=0):
@@ -171,8 +178,9 @@ def maml_model(eth_train, x_train, y_train, x_test, y_test,epochs=20000,batch_si
             l1_params = jnp.linalg.norm(net_params[i], 1)
         return jnp.mean((targets - predictions) ** 2) + reg_weight_lin * jnp.linalg.norm(net_params[0], 1)
 
-    def accuracy(params, inputs, targets):
+    def mse(params, inputs, targets):
         predictions = net_apply(params, inputs)
+        #print(inputs)
         #print(predictions)
         #print(targets)
         #print(jnp.mean((targets - predictions) ** 2))
@@ -181,13 +189,8 @@ def maml_model(eth_train, x_train, y_train, x_test, y_test,epochs=20000,batch_si
     def rsquare(params, inputs, targets):
         yhat = net_apply(params, inputs)
         y = targets
-        #SS_Residual = (y-yhat).T@(y-yhat)
-        #SS_Total = np.sum((y - np.mean(y)) ** 2)
-        #r_squared = 1 - (SS_Residual / SS_Total)
-        #adjusted_r_squared = 1 - ((1 - r_squared) * (len(y) - 1) / (len(y) - inputs.shape[1]-1))
         return scipy.stats.pearsonr(np.reshape(yhat,len(yhat)), np.reshape(y,len(y)))[0]
 
-        #return (yhat - np.mean(y)).T @ (yhat - np.mean(y)) / (y - np.mean(y)).T @ (y - np.mean(y))
 
     def inner_update(p, x1, y1):
         grads = grad(loss)(p, x1, y1)
@@ -244,11 +247,11 @@ def maml_model(eth_train, x_train, y_train, x_test, y_test,epochs=20000,batch_si
         # print('Post step ' + str(i)+' update test MSE='+str(post_error))
 
     # post_predictions = vmap(partial(net_apply, net_params))(x_test)
-    maml_acc = accuracy(net_params, x_test[test_indx], y_test[test_indx])
+    maml_err = mse(net_params, x_test[test_indx], y_test[test_indx])
     r2= rsquare(net_params, x_test[test_indx], y_test[test_indx])
-    print('Test accuracy on Task:', maml_acc)
+    #print('Test accuracy on Task:', maml_err)
 
-    return np_batched_maml_loss, maml_acc, r2
+    return np_batched_maml_loss, maml_err, r2
 
 
 def base_linear_model(eth_train, x_train, y_train, x_test, y_test,epochs=20000,batch_size=20):
@@ -259,7 +262,7 @@ def base_linear_model(eth_train, x_train, y_train, x_test, y_test,epochs=20000,b
     out_shape, basenet_params = basenet_init(rng, input_shape=in_shape)
     opt_init, opt_update, get_params = optimizers.adam(step_size=lr)
     opt_state = opt_init(basenet_params)
-
+    #print(basenet_params)
     @jit
     def step(i, opt_state, x1, y1):
         p = get_params(opt_state)
@@ -282,21 +285,17 @@ def base_linear_model(eth_train, x_train, y_train, x_test, y_test,epochs=20000,b
         task_losses = vmap(partial(loss, p))(x1, y1)
         return jnp.mean(task_losses)
 
-    def accuracy(params, inputs, targets):
+    def mse(params, inputs, targets):
         predictions = basenet_apply(params, inputs)
+        #print(inputs)
+        #print(params)
+        #print(predictions)
         return jnp.mean((targets - predictions) ** 2)
 
     def rsquare(params,inputs,targets):
         yhat = basenet_apply(params, inputs)
         y=targets
-        #SS_Residual = np.sum((y - yhat) ** 2)
-        #SS_Total = np.sum((y - np.mean(y)) ** 2)
-        #r_squared = 1 - (SS_Residual / SS_Total)
-        #adjusted_r_squared = 1 - ((1 - r_squared) * (len(y) - 1) / (len(y) - inputs.shape[1] - 1))
-        #print((float(SS_Residual)),SS_Total,1 - (SS_Residual / SS_Total), r_squared,adjusted_r_squared)
-        #print('rsq',len(y),len(yhat),np.cov(y,yhat))
         return scipy.stats.pearsonr(np.reshape(yhat,len(yhat)), np.reshape(y,len(y)))[0]
-        #return (yhat-np.mean(y)).T@(yhat-np.mean(y))/(y-np.mean(y)).T@(y-np.mean(y))
 
 
     np_batched_loss = []
@@ -314,11 +313,12 @@ def base_linear_model(eth_train, x_train, y_train, x_test, y_test,epochs=20000,b
     test_indx = np.delete(np.arange(x_test.shape[0]), indx)
     x1, y1 = x_test[indx], y_test[indx]
     for i in range(batch_size):
+        #print(str(i), basenet_params)
         basenet_params = update(basenet_params, x1, y1)
 
-    lin_test_error = accuracy(basenet_params, x_test[test_indx], y_test[test_indx])
+    lin_test_error = mse(basenet_params, x_test[test_indx], y_test[test_indx])
     lin_r2 = rsquare(basenet_params, x_test[test_indx], y_test[test_indx])
-    print('test error MSE', lin_test_error)
+    #print('test error MSE', lin_test_error)
     return np_batched_loss, lin_test_error,lin_r2
 
 
@@ -400,7 +400,7 @@ def maml_logistic_model(eth_train, x_train, y_train, x_test, y_test,epochs=20000
 
     # post_predictions = vmap(partial(net_apply, net_params))(x_test)
     logistic_maml_acc = accuracy(net_params, x_test[test_indx], y_test[test_indx])
-    print('Test Accuracy on Task: MSE = ', logistic_maml_acc)
+    #print('Test Accuracy on Task: MSE = ', logistic_maml_acc)
 
     return np_batched_maml_loss, logistic_maml_acc
 
@@ -465,5 +465,118 @@ def base_logistic_model(eth_train, x_train, y_train, x_test, y_test,epochs=20000
 
     logistic_test_acc = accuracy(basenet_params, x_test, y_test)
 
-    print('test error accuracy', logistic_test_acc)
+    #print('test error accuracy', logistic_test_acc)
     return np_batched_loss, logistic_test_acc
+
+
+def task_maml(task,x,y):
+    # task is the ethnic subpopulation we want to test
+    # preparing training data by removing the task data from training data
+    x_train=x.drop(task,axis=0)
+    y_train=y.drop(task,axis=0)
+    eth_train=np.delete(eth,np.where(eth == task))
+    x_test=x.loc[task].to_numpy()
+    y_test=y.loc[task].to_numpy()
+    y_test=np.reshape(y_test,(-1,1))
+   # eth_train=np.delete(eth, np.where(eth == task))
+
+    #train and test using different models
+    beta = base_linear_model(eth_train, x_train, y_train, x_test, y_test, epochs, batch_size)
+    lin_test_error = beta[1]
+    lin_r2=beta[2]
+
+    alpha=maml_model(eth_train,x_train,y_train,x_test,y_test,epochs,batch_size,num_task_sample)
+    maml_error=alpha[1]
+    maml_r2=alpha[2]
+
+    L = task, maml_error, lin_test_error,maml_r2, lin_r2
+
+    return alpha[0],beta[0],L
+
+def logistic_task_maml(task,x,y,model_type):
+ # task is the ethnic subpopulation we want to test
+ # preparing training data by removing the task data from training data
+ x_train = x.drop(task, axis=0)
+ y_train = y.drop(task, axis=0)
+ eth_train = np.delete(eth, np.where(eth == task))
+ x_test = x.loc[task].to_numpy()
+ y_test = y.loc[task].to_numpy()
+ y_test = np.reshape(y_test, (-1, 1))
+ eth_train = np.delete(eth, np.where(eth == task))
+
+ beta = base_logistic_model(eth_train, x_train, y_train, x_test, y_test, epochs, batch_size)
+ lin_test_error = 1-beta[1]
+
+ alpha = maml_logistic_model(eth_train, x_train, y_train, x_test, y_test, epochs, batch_size, num_task_sample)
+ maml_error = 1-alpha[1]
+
+ L = task, maml_error, lin_test_error
+ if(model_type=='hetero'):
+     #hetero_acc_vec.append(L)
+     return alpha[0],beta[0],L
+
+
+ if(model_type=='compensatory'):
+     #compensatory_acc_vec.append(L)
+     return alpha[0], beta[0],L
+
+def execution(model_type,times,test_task_num,x,pop_dic):
+    x=x
+    eth=pop_dic
+    error_vec=[]
+    tasks= random.sample(list(eth),k=test_task_num)
+    maml_loss_vec=[]
+    lin_loss_vec=[]
+    for t in tasks:
+        for i in range(times):
+            if model_type=='linear':
+                y=linear_model(eth,x)
+                maml_loss, lin_loss, L = task_maml(t, x, y)
+            if model_type=='hetero':
+                y= hetero_model(eth, x)
+                maml_loss, lin_loss, L = logistic_task_maml(t, x, y, model_type='hetero')
+            if model_type=='compensatory':
+                y=compensatory_model(eth,x)
+                maml_loss, lin_loss, L = logistic_task_maml(t, x, y, model_type='compensatory')
+
+            maml_loss_vec.append(maml_loss)
+            lin_loss_vec.append(lin_loss)
+            error_vec.append(L)
+
+    maml_loss_vec1 = pd.DataFrame(maml_loss_vec)
+    maml_loss_vec1 = maml_loss_vec1.mean()
+    lin_loss_vec1 = pd.DataFrame(lin_loss_vec)
+    lin_loss_vec1 = lin_loss_vec1.mean()
+
+    plt.plot(maml_loss_vec1,  label='maml')
+    plt.plot(lin_loss_vec1, label='lin')
+    plt.legend()
+    plt.savefig(model_type+str(epochs)+'.png')
+
+    if model_type=='linear':
+        print('linear')
+        L1 = pd.DataFrame(error_vec, columns=['task', 'maml_error', 'lin_error','maml_r2','lin_r2'])
+        a = L1.set_index('task')
+        for subpop in list(a.index.unique()):
+            print(subpop)
+            print(a.loc[subpop].mean())
+
+        print((a.mean()))
+    else:
+        L1 = pd.DataFrame(error_vec, columns=['task', 'maml_error', 'lin_error'])
+        a=L1.groupby('task')
+        print(a.mean())
+        print(a.mean().mean())
+
+    return L1,lin_loss_vec1,maml_loss_vec1
+
+
+
+#input data
+data1=pd.read_csv('../genotype_data/processed_data_apr05.csv',index_col=[0,1])
+eth_ID=pd.read_csv('../individual_dict/eth_ID.csv',index_col=[0])
+eth=eth_ID['eth'].unique()
+
+
+#L1,lin_loss_vec1,maml_loss_vec1=execution('linear',times,test_task_num,data1,eth)
+#print('compensatory')
